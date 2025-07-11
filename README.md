@@ -1,8 +1,13 @@
 # powershell_tool_report
-PowerShellScriptの、ちょっと便利なツールやレポート集
+PowerShellScriptの、ちょっと便利なツールやレポート集  
+
+## powershell-excel-com-demo.ps1
+Excel装飾自動化ツール - PowerShell COMオブジェクト デモンストレーション  
+  
+既存のExcelファイルに対して、セルの装飾（背景色、網掛け、斜線等）を会話形式で適用するデモンストレーションツールです。  
 
 
-
+  
 ## Excel-COM-HolidayProcessor.ps1
 外部のエクセルファイルに登録してい休祭日データと土日データを合わせて出力するコード  
 休祭日のデータ形式
