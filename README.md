@@ -11,6 +11,10 @@ A列    B列    C列    D列    E列
 3行 祝日2  祝日2  祝日2  祝日2  祝日2
 ```
 
+## make_view_markdown.ps1
+HTTPListenerを使ったmarkdownエディタ/ビューワー
+コンプライアンス上厳しい制限が掛けられていてもmaekdownは便利に使いたいため作成
+
 ## powershell-excel-com-demo.ps1
 Excel装飾自動化ツール - PowerShell COMオブジェクト デモンストレーション  
   
