@@ -11,7 +11,7 @@ A列    B列    C列    D列    E列
 3行 祝日2  祝日2  祝日2  祝日2  祝日2
 ```
 
-##clear_sharepoint_webdav_cache.ps1
+## clear_sharepoint_webdav_cache.ps1
 edgeのIE互換モードのクッキー一時ファイル削除ツール
 SharePointOnlineの「エクスプローラーで開く」機能AD認証のトークンの期限があり、期間を超えた時に使用するIEの互換モードのクッキーと一時ファイルを削除ツール
 経緯は以下に
