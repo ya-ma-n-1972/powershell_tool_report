@@ -8,6 +8,9 @@ PowerShellScriptの、ちょっと便利なツールやレポート集
 複数のファイルをグループ管理し、クリップボードに一括登録できるPowerShellツールです。
 主にClaudeなどの生成AIのチャットでファイルをアップロードする際のサポートになります
 
+詳しくはこちら
+https://qiita.com/ya-man-kys/items/92623bdece481762ef50
+
 <hr></hr>
 
 ### Get-PathTree
