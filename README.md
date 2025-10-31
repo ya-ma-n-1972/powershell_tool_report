@@ -3,7 +3,7 @@
 PowerShellScriptの、ちょっと便利なツールやレポート集  
 <hr></hr>
 
-#### File-Clipboard-Manager
+### File-Clipboard-Manager
 
 複数のファイルをグループ管理し、クリップボードに一括登録できるPowerShellツールです。
 主にClaudeなどの生成AIのチャットでファイルをアップロードする際のサポートになります
