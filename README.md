@@ -3,6 +3,13 @@
 PowerShellScriptの、ちょっと便利なツールやレポート集  
 <hr></hr>
 
+#### File-Clipboard-Manager
+
+複数のファイルをグループ管理し、クリップボードに一括登録できるPowerShellツールです。
+主にClaudeなどの生成AIのチャットでファイルをアップロードする際のサポートになります
+
+<hr></hr>
+
 ### Get-PathTree
 Windows/WSL2両対応のフォルダツリー生成ツール - GUIで簡単操作、コメント記号付きツリー
 
