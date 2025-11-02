@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     File Clipboard Manager - ファイルをクリップボードに登録するツール
 
@@ -8,8 +8,8 @@
 
 .NOTES
     Author: ya-man
-    Version: 1.0.0
-    Date: 2025-10-31
+    Version: 1.1
+    Date: 2025-11-03
     Requires: PowerShell 5.1 or later, Windows Forms
 #>
 
@@ -221,6 +221,145 @@ function Set-ClipboardTextWithFence($filePath) {
     }
 }
 
+<#
+.SYNOPSIS
+    クリップボードの内容をフェンス付きテキストに変換
+.DESCRIPTION
+    クリップボード内のファイルまたはテキストをフェンス付きテキストに変換します。
+    ファイルとテキストの両方に対応し、設定ウィンドウへの登録なしで使用できます。
+#>
+function Set-ClipboardFileWithFence {
+    # クリップボードからファイルリストを取得
+    $fileList = [System.Windows.Forms.Clipboard]::GetFileDropList()
+
+    # ファイル形式が入っている場合
+    if ($null -ne $fileList -and $fileList.Count -gt 0) {
+        # エラーチェック1: 複数ファイルでないか
+        if ($fileList.Count -gt 1) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "複数ファイルには対応していません。1つのファイルを選択してください",
+                "エラー",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            return
+        }
+
+        $filePath = $fileList[0]
+
+        # エラーチェック2: ファイルが存在するか
+        if (-not (Test-Path $filePath)) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "ファイルが見つかりません",
+                "エラー",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
+            return
+        }
+
+        # エラーチェック3: テキストファイルか（拡張子チェック）
+        $textExtensions = @('.txt', '.ps1', '.psm1', '.psd1', '.cs', '.vb', '.js', '.ts',
+                            '.html', '.htm', '.xml', '.json', '.css', '.md', '.log',
+                            '.csv', '.ini', '.config', '.bat', '.cmd', '.py', '.rb',
+                            '.java', '.c', '.cpp', '.h', '.hpp', '.php', '.sh')
+
+        $ext = [System.IO.Path]::GetExtension($filePath).ToLower()
+
+        if ($textExtensions -notcontains $ext) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "テキストファイルではありません",
+                "エラー",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            return
+        }
+
+        # エラーチェック4: ファイルサイズが30MB以下か
+        $fileSize = (Get-Item $filePath).Length
+        $maxSize = 30MB
+
+        if ($fileSize -gt $maxSize) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "ファイルサイズが30MBを超えています",
+                "エラー",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            return
+        }
+
+        # ファイル内容を読み込み＋フェンスで囲む
+        try {
+            $content = Get-Content $filePath -Raw -Encoding UTF8
+            $fence = '```'
+            $text = $fence + "`n" + $content + "`n" + $fence
+
+            # クリップボードに再登録
+            [System.Windows.Forms.Clipboard]::SetText($text)
+
+            # 成功メッセージ
+            $fileName = [System.IO.Path]::GetFileName($filePath)
+            Show-Message "$fileName にフェンスを追加してクリップボードに登録しました"
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                "ファイルの読み込みに失敗しました: $_",
+                "エラー",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
+        }
+        return
+    }
+
+    # テキスト形式が入っている場合
+    if ([System.Windows.Forms.Clipboard]::ContainsText()) {
+        try {
+            $content = [System.Windows.Forms.Clipboard]::GetText()
+
+            # 空のテキストチェック
+            if ([string]::IsNullOrWhiteSpace($content)) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "クリップボードのテキストが空です",
+                    "エラー",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Warning
+                )
+                return
+            }
+
+            # フェンスで囲む
+            $fence = '```'
+            $text = $fence + "`n" + $content + "`n" + $fence
+
+            # クリップボードに再登録
+            [System.Windows.Forms.Clipboard]::SetText($text)
+
+            # 成功メッセージ
+            Show-Message "テキストにフェンスを追加してクリップボードに登録しました"
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                "テキストの処理に失敗しました: $_",
+                "エラー",
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            )
+        }
+        return
+    }
+
+    # ファイルもテキストも入っていない場合
+    [System.Windows.Forms.MessageBox]::Show(
+        "クリップボードにファイルまたはテキストがコピーされていません",
+        "エラー",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Warning
+    )
+}
+
 # ================================================================================
 # クリップボード登録（グループ全体のフェンス付きテキスト方式）
 # ================================================================================
@@ -306,8 +445,9 @@ function Move-FileToGroup($sourceGroupIndex, $fileIndex, $targetGroupIndex) {
     $filePath = $script:config.groups[$sourceGroupIndex].files[$fileIndex]
 
     # ソースから削除
-    $script:config.groups[$sourceGroupIndex].files =
+    $script:config.groups[$sourceGroupIndex].files = @(
         $script:config.groups[$sourceGroupIndex].files | Where-Object { $_ -ne $filePath }
+    )
 
     # ターゲットに追加
     $script:config.groups[$targetGroupIndex].files += $filePath
@@ -331,7 +471,7 @@ function Move-FileToGroup($sourceGroupIndex, $fileIndex, $targetGroupIndex) {
 function Show-MainWindow {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "File Clipboard Manager"
-    $form.Size = New-Object System.Drawing.Size(450, 390)
+    $form.Size = New-Object System.Drawing.Size(450, 430)
     $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
     $form.MaximizeBox = $false
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
@@ -395,10 +535,20 @@ function Show-MainWindow {
         $form.Controls.Add($btnFence)
     }
 
+    # クリップボードにフェンス追加ボタン
+    $btnClipboardFence = New-Object System.Windows.Forms.Button
+    $btnClipboardFence.Text = "クリップボードにフェンス追加"
+    $btnClipboardFence.Location = New-Object System.Drawing.Point(10, 290)
+    $btnClipboardFence.Size = New-Object System.Drawing.Size(250, 30)
+    $btnClipboardFence.Add_Click({
+        Set-ClipboardFileWithFence
+    })
+    $form.Controls.Add($btnClipboardFence)
+
     # メッセージ表示エリア
     $script:messageLabel = New-Object System.Windows.Forms.Label
     $script:messageLabel.Text = ""
-    $script:messageLabel.Location = New-Object System.Drawing.Point(10, 300)
+    $script:messageLabel.Location = New-Object System.Drawing.Point(10, 340)
     $script:messageLabel.Size = New-Object System.Drawing.Size(420, 30)
     $script:messageLabel.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
     $script:messageLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
@@ -518,8 +668,9 @@ function Show-ConfigWindow($groupIndex, $groupLabels, $sizeLabels) {
         $selectedDisplayText = $listBox.SelectedItem
         $selectedFilePath = ConvertFrom-DisplayFormat $selectedDisplayText
 
-        $script:config.groups[$groupIndex].files =
+        $script:config.groups[$groupIndex].files = @(
             $script:config.groups[$groupIndex].files | Where-Object { $_ -ne $selectedFilePath }
+        )
 
         & $updateListBox
         Show-Message "ファイルを削除しました"
