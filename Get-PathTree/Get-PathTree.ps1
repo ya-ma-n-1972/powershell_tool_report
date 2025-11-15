@@ -1,5 +1,5 @@
 ###############################################################
-# Windows/WSL2両対応 フォルダツリー生成器（最終版）
+# Windows/WSL2両対応 フォルダツリー生成器
 # GUIでフォルダツリーを取得し、ツリー形式で出力するツール
 # - Windowsパス/WSLパス両対応
 # - ツリー表示・チェックボックス選択・ツリー編集・コピー機能
@@ -43,8 +43,8 @@ class FileSystemNode {
 }
 
 ###############################################################
-# パス判定とコア機能
-# Windowsパス/WSLパスの判定（UNC形式やLinux形式も考慮）
+# パス判定機能
+# Windowsパス/WSLパスの判定（UNC形式やLinux形式に対応）
 ###############################################################
 function Get-PathType {
     param([string]$Path)
@@ -64,29 +64,41 @@ function Get-PathType {
 
 ###############################################################
 # WindowsパスをWSLパスに変換
-# Linuxコマンドで使用するためのパス変換
+# Windows形式のパス（UNC形式やドライブレター）をLinux形式に変換
+# 戻り値: @{ Path = "変換後のパス", Distro = "ディストリビューション名" }
 ###############################################################
 function Convert-ToWSLPath {
     param([string]$WindowsPath)
-    
+
     if ($WindowsPath -match '^\\\\wsl[\.\$](?:localhost\\)?([^\\]+)(.*)') {
         $distro = $Matches[1]
         $path = $Matches[2] -replace '\\', '/'
-        
+
         # ディストリビューションルートの場合
         if ([string]::IsNullOrEmpty($path)) {
-            return "/"  # 空文字列ではなく "/" を返す
+            $path = "/"
         }
-        return $path
+
+        # ディストロとパスの両方を返す
+        return @{
+            Path = $path
+            Distro = $distro
+        }
     }
-    
+
     if ($WindowsPath -match '^([A-Z]):(.*)') {
         $drive = $Matches[1].ToLower()
         $path = $Matches[2] -replace '\\', '/'
-        return "/mnt/$drive$path"
+        return @{
+            Path = "/mnt/$drive$path"
+            Distro = $null
+        }
     }
-    
-    return $WindowsPath
+
+    return @{
+        Path = $WindowsPath
+        Distro = $null
+    }
 }
 
 ###############################################################
@@ -114,10 +126,11 @@ function Get-WindowsDirectoryTree {
     if (-not $rootName) { $rootName = $Path } # ルートドライブの場合
     $rootNode = [FileSystemNode]::new($rootName, $Path, $true) # ルートノード作成
 
-    # 再帰的にディレクトリをスキャンする内部関数
+    # 再帰的にディレクトリをスキャンする内部ScriptBlock
     # - 指定深度までディレクトリ/ファイルを探索
     # - FileSystemNodeツリーを構築
-    function Scan-Directory {
+    # ScriptBlockとして定義してスコープ汚染を防止
+    $scanDirectory = {
         param(
             [string]$DirectoryPath, # 現在探索中のディレクトリ
             [FileSystemNode]$ParentNode, # 親ノード
@@ -128,25 +141,30 @@ function Get-WindowsDirectoryTree {
 
         # 指定された深度に達したら、それ以上深く探索しない
         if ($CurrentDepth -ge $MaxDepth) { return }
-        
+
         try {
-            # Get-ChildItemでディレクトリ内のサブディレクトリを取得 ファイル情報は除く
-            $directories = Get-ChildItem -Path $DirectoryPath -Directory -ErrorAction SilentlyContinue
+            # Get-ChildItemでディレクトリ内のサブディレクトリを取得
+            # -Attributes !ReparsePoint: ジャンクション/シンボリックリンクを除外
+            #   （循環参照や予期しない巨大ツリーの展開を防ぐため）
+            # Sort-Object Name: アルファベット順にソート（WSL側と統一、実行ごとの安定性向上）
+            $directories = Get-ChildItem -Path $DirectoryPath -Directory -Attributes !ReparsePoint -ErrorAction SilentlyContinue | Sort-Object Name
             # サブディレクトリごとにノードを作成し、再帰的にスキャン
             foreach ($dir in $directories) {
                 $dirNode = [FileSystemNode]::new($dir.Name, $dir.FullName, $true)
                 $ParentNode.AddChild($dirNode)
-                
-                Scan-Directory -DirectoryPath $dir.FullName `
+
+                # 再帰呼び出し（& 演算子でScriptBlockを実行）
+                & $scanDirectory -DirectoryPath $dir.FullName `
                               -ParentNode $dirNode `
                               -CurrentDepth ($CurrentDepth + 1) `
                               -MaxDepth $MaxDepth `
                               -IncludeFiles $IncludeFiles
             }
-            
+
             if ($IncludeFiles) {
                 # Get-ChildItemでディレクトリ内のファイルを取得
-                $files = Get-ChildItem -Path $DirectoryPath -File -ErrorAction SilentlyContinue
+                # Sort-Object Name: アルファベット順にソート（WSL側と統一、実行ごとの安定性向上）
+                $files = Get-ChildItem -Path $DirectoryPath -File -ErrorAction SilentlyContinue | Sort-Object Name
                 foreach ($file in $files) {
                     $fileNode = [FileSystemNode]::new($file.Name, $file.FullName, $false)
                     $ParentNode.AddChild($fileNode)
@@ -158,8 +176,8 @@ function Get-WindowsDirectoryTree {
         }
     }
 
-    #  内部関数 Scan-Directory のエントリーポイント
-        Scan-Directory -DirectoryPath $Path -ParentNode $rootNode -CurrentDepth 0 -MaxDepth $MaxDepth -IncludeFiles $IncludeFiles
+    # ScriptBlock のエントリーポイント
+    & $scanDirectory -DirectoryPath $Path -ParentNode $rootNode -CurrentDepth 0 -MaxDepth $MaxDepth -IncludeFiles $IncludeFiles
     
     return $rootNode
 }
@@ -175,14 +193,17 @@ function Get-WSLDirectoryTree {
         [int]$MaxDepth = 3,         # 探索する最大深度
         [bool]$IncludeFiles = $true # ファイルも含めるかどうか
     )
-    
+
     # Windows UNC形式（\\wsl.localhost\Ubuntu\path）をLinux形式（/path）に変換
     # 異なる環境間でのパス形式の統一が必要
-    $wslPath = if ($Path -match '^\\\\wsl') {
+    $wslInfo = if ($Path -match '^\\\\wsl') {
         Convert-ToWSLPath -WindowsPath $Path
     } else {
-        $Path
+        @{ Path = $Path; Distro = $null }
     }
+
+    $wslPath = $wslInfo.Path
+    $distro = $wslInfo.Distro
     
     # ルートディレクトリの場合は警告して中止
     if ($wslPath -eq "/") {
@@ -206,7 +227,11 @@ function Get-WSLDirectoryTree {
         # WSL環境でパスの存在確認（Linuxコマンドを実行）
         # Windows側からは直接アクセスできないため、WSL経由で確認が必要
         $checkCommand = "test -d '$wslPath' && echo 'EXISTS' || echo 'NOT_EXISTS'"
-        $exists = wsl bash -c $checkCommand 2>$null
+        $exists = if ($distro) {
+            wsl -d $distro bash -c $checkCommand 2>$null
+        } else {
+            wsl bash -c $checkCommand 2>$null
+        }
         
         if ($exists -ne 'EXISTS') {
             [System.Windows.Forms.MessageBox]::Show(
@@ -218,10 +243,15 @@ function Get-WSLDirectoryTree {
             return $rootNode
         }
         
-    # findコマンドで全ディレクトリを一括取得（Windows版のような再帰処理は不要）
-    # WSL側で効率的に処理し、結果を文字列リストとして受け取る
+        # findコマンドで全ディレクトリを一括取得
+        # -maxdepthで効率的に深度を制限（Windows版のようなPowerShellでの再帰処理は不要）
+        # WSL側で効率的に処理し、結果を文字列リストとして受け取る
         $findCommand = "cd '$wslPath' 2>/dev/null && find . -maxdepth $MaxDepth -type d 2>/dev/null | sort"
-        $directories = @(wsl bash -c $findCommand)
+        $directories = if ($distro) {
+            @(wsl -d $distro bash -c $findCommand)
+        } else {
+            @(wsl bash -c $findCommand)
+        }
         
     # パスマップで親子関係を管理（文字列から階層構造を再構築するため）
     # キー: パス文字列、値: 対応するノードオブジェクト
@@ -263,7 +293,11 @@ function Get-WSLDirectoryTree {
         if ($IncludeFiles) {
             # findコマンドで全ファイルを一括取得
             $filesCommand = "cd '$wslPath' 2>/dev/null && find . -maxdepth $MaxDepth -type f 2>/dev/null | sort"
-            $files = @(wsl bash -c $filesCommand)
+            $files = if ($distro) {
+                @(wsl -d $distro bash -c $filesCommand)
+            } else {
+                @(wsl bash -c $filesCommand)
+            }
             
             # ファイルごとに親ディレクトリを特定して追加
             foreach ($file in $files) {
@@ -295,7 +329,7 @@ function Get-WSLDirectoryTree {
         }
     }
     catch {
-    # WSL関連のエラー（WSL未インストール、起動失敗など）をキャッチ
+        # WSL関連のエラー（WSL未インストール、起動失敗など）をキャッチ
         [System.Windows.Forms.MessageBox]::Show(
             "WSLアクセスエラー: $_`n`nWSLがインストールされていることを確認してください",
             "エラー",
@@ -347,21 +381,26 @@ function Get-DirectoryTree {
 }
 
 ###############################################################
-# ツリー生成（コメント対応版）
+# ツリー文字列生成
 # FileSystemNodeツリーからツリー形式の文字列を生成
 # - チェックされたノードのみ出力
-# - 階層/接続記号（├──, └──）で見やすく
-# - コメント用の // を揃えて付与
+# - 階層/接続記号（├──, └──）で見やすく表示
+# - コメント記号（//、#、なし）を選択可能
 ###############################################################
 function ConvertTo-TreeOutput {
     param(
         [FileSystemNode]$Node,    # 処理対象のノード
         [string]$Prefix = "",      # 現在の階層のプレフィックス（インデント用）
         [bool]$IsLast = $true,     # 兄弟ノード中で最後かどうか
-        [bool]$IsRoot = $true      # ルートノードかどうか
+        [bool]$IsRoot = $true,     # ルートノードかどうか
+
+        # コメント記号スタイル
+        [ValidateSet("//", "#", "None")]
+        [string]$CommentStyle = "//"
     )
     
     # 文字列の表示幅を計算する内部関数（全角文字対応）
+    # 全角文字は2文字分、半角文字は1文字分としてカウントし、見た目の幅を揃えるために使用
     function Get-DisplayWidth {
         param([string]$Text)
         $width = 0
@@ -381,82 +420,95 @@ function ConvertTo-TreeOutput {
     }
     
     # まず通常のツリーを生成（現在の処理をそのまま実行）
-    $script:lines = @()  # スクリプトスコープで配列を保持
-    
-    # ツリー生成の内部再帰関数
-    function Build-TreeLines {
+    # ローカルスコープで配列を保持（関数内でのみ有効）
+    # ArrayList を使用することで、内部関数からも直接変更可能
+    $lines = [System.Collections.ArrayList]::new()
+
+    # ツリー生成の内部再帰ScriptBlock
+    # 注: ArrayList は参照型なので、ScriptBlockから直接 $lines を操作できます
+    # ScriptBlockとして定義してスコープ汚染を防止
+    $buildTreeLines = {
         param(
             [FileSystemNode]$Node,
             [string]$Prefix = "",
             [bool]$IsLast = $true,
             [bool]$IsRoot = $true
         )
-        
+
         if ($IsRoot) {
             $nodeName = if ($Node.IsDirectory) { "$($Node.Name)/" } else { $Node.Name }
-            $script:lines += $nodeName
-            
+            [void]$lines.Add($nodeName)
+
             $checkedChildren = $Node.Children | Where-Object { $_.IsChecked }
-            
+
             for ($i = 0; $i -lt $checkedChildren.Count; $i++) {
                 $child = $checkedChildren[$i]
                 $isLastChild = ($i -eq $checkedChildren.Count - 1)
-                Build-TreeLines -Node $child -Prefix "" -IsLast $isLastChild -IsRoot $false
+                # 再帰呼び出し（& 演算子でScriptBlockを実行）
+                & $buildTreeLines -Node $child -Prefix "" -IsLast $isLastChild -IsRoot $false
             }
         }
         else {
             if (-not $Node.IsChecked) { return }
-            
+
             $connector = if ($IsLast) { "└── " } else { "├── " }
             $nodeName = if ($Node.IsDirectory) { "$($Node.Name)/" } else { $Node.Name }
-            $script:lines += "$Prefix$connector$nodeName"
-            
+            [void]$lines.Add("$Prefix$connector$nodeName")
+
             $childPrefix = $Prefix + $(if ($IsLast) { "    " } else { "│   " })
-            
+
             $checkedChildren = $Node.Children | Where-Object { $_.IsChecked }
             for ($i = 0; $i -lt $checkedChildren.Count; $i++) {
                 $child = $checkedChildren[$i]
                 $isLastChild = ($i -eq $checkedChildren.Count - 1)
-                Build-TreeLines -Node $child -Prefix $childPrefix -IsLast $isLastChild -IsRoot $false
+                # 再帰呼び出し（& 演算子でScriptBlockを実行）
+                & $buildTreeLines -Node $child -Prefix $childPrefix -IsLast $isLastChild -IsRoot $false
             }
         }
     }
-    
+
     # ツリー構造を生成
-    Build-TreeLines -Node $Node -Prefix $Prefix -IsLast $IsLast -IsRoot $IsRoot
-    
+    & $buildTreeLines -Node $Node -Prefix $Prefix -IsLast $IsLast -IsRoot $IsRoot
+
     # 最長行の表示幅を計算
     $maxWidth = 0
-    foreach ($line in $script:lines) {
+    foreach ($line in $lines) {
         $width = Get-DisplayWidth -Text $line
         if ($width -gt $maxWidth) {
             $maxWidth = $width
         }
     }
-    
+
     # コメント位置を決定（最長行 + 5文字、ただし最小40文字）
     $commentPosition = [Math]::Max($maxWidth + 5, 40)
-    
-    # 各行にパディングを追加して // を付与
+
+    # 各行にコメント記号を付与
     $outputLines = @()
-    foreach ($line in $script:lines) {
+    foreach ($line in $lines) {
         if ([string]::IsNullOrWhiteSpace($line)) {
             $outputLines += $line
         }
         else {
-            $currentWidth = Get-DisplayWidth -Text $line
-            $paddingCount = $commentPosition - $currentWidth
-            
-            # パディングが負の値にならないよう保護
-            if ($paddingCount -lt 0) {
-                $paddingCount = 2  # 最小でも2スペース確保
+            if ($CommentStyle -eq "None") {
+                # コメントなしモード
+                $outputLines += $line
             }
-            
-            $padding = " " * $paddingCount
-            $outputLines += "${line}${padding}//"
+            else {
+                # 標準モード: スペースで埋めてコメント記号を配置
+                $currentWidth = Get-DisplayWidth -Text $line
+                $paddingCount = $commentPosition - $currentWidth
+
+                # パディングが負の値にならないよう保護
+                if ($paddingCount -lt 0) {
+                    $paddingCount = 2  # 最小でも2スペース確保
+                }
+
+                $padding = " " * $paddingCount
+                $outputLines += "${line}${padding}${CommentStyle}"
+            }
         }
     }
-    
+
     # 改行で結合して返す
     return ($outputLines -join "`r`n") + "`r`n"
 }
@@ -573,42 +625,42 @@ $loadButton.Add_Click({
         $rootTreeNode.Tag = $script:rootNode  # FileSystemNodeオブジェクトを紐付け
         $rootTreeNode.Checked = $false        # 初期状態は未選択
         
-    # 再帰的な子ノード追加
-    function Add-TreeNodes {
+    # 再帰的な子ノード追加（ScriptBlockとして定義してスコープ汚染を防止）
+    $addTreeNodes = {
             param($ParentTreeNode, $ParentFileNode)
-            
+
             foreach ($child in $ParentFileNode.Children) {
                 # 子ノードを作成
                 $childTreeNode = New-Object System.Windows.Forms.TreeNode
-                
+
                 # ディレクトリなら末尾に/を付ける
-                $childTreeNode.Text = if ($child.IsDirectory) { 
-                    "$($child.Name)/" 
-                } else { 
-                    $child.Name 
+                $childTreeNode.Text = if ($child.IsDirectory) {
+                    "$($child.Name)/"
+                } else {
+                    $child.Name
                 }
-                
+
                 # FileSystemNodeオブジェクトを紐付け
                 $childTreeNode.Tag = $child
                 $childTreeNode.Checked = $false
-                
+
                 # ディレクトリを青色で表示
                 if ($child.IsDirectory) {
                     $childTreeNode.ForeColor = [System.Drawing.Color]::Blue
                 }
-                
+
                 # 親ノードに追加
                 $ParentTreeNode.Nodes.Add($childTreeNode)
-                
-                # 子がさらに子を持つ場合は再帰呼び出し
+
+                # 子がさらに子を持つ場合は再帰呼び出し（& 演算子でScriptBlockを実行）
                 if ($child.Children.Count -gt 0) {
-                    Add-TreeNodes -ParentTreeNode $childTreeNode -ParentFileNode $child
+                    & $addTreeNodes -ParentTreeNode $childTreeNode -ParentFileNode $child
                 }
             }
         }
-        
-        # ローカル関数を呼び出して全階層を構築
-        Add-TreeNodes -ParentTreeNode $rootTreeNode -ParentFileNode $script:rootNode
+
+        # ScriptBlockを呼び出して全階層を構築
+        & $addTreeNodes -ParentTreeNode $rootTreeNode -ParentFileNode $script:rootNode
         
         # ルートノードをツリービューに追加
         $treeView.Nodes.Add($rootTreeNode)
@@ -633,17 +685,18 @@ $selectAllButton.Text = "全選択"
 $selectAllButton.Location = New-Object System.Drawing.Point(120, 65)
 $selectAllButton.Size = New-Object System.Drawing.Size(75, 30)
 $selectAllButton.Anchor = "Top,Left"  # 上左に固定
-# 再帰的なチェック処理
+# 再帰的なチェック処理（ScriptBlockとして定義してスコープ汚染を防止）
 $selectAllButton.Add_Click({
-    function Set-AllNodes {
+    $setAllNodes = {
         param($Node, $Checked)
         $Node.Checked = $Checked        # 現在のノードをチェック
         foreach ($child in $Node.Nodes) {
-            Set-AllNodes -Node $child -Checked $Checked  # 子ノードを再帰処理
+            # 再帰呼び出し（& 演算子でScriptBlockを実行）
+            & $setAllNodes -Node $child -Checked $Checked
         }
     }
     foreach ($node in $treeView.Nodes) {
-        Set-AllNodes -Node $node -Checked $true  # trueで全選択
+        & $setAllNodes -Node $node -Checked $true  # trueで全選択
     }
 })
 $form.Controls.Add($selectAllButton)
@@ -653,18 +706,19 @@ $deselectAllButton.Text = "全解除"
 $deselectAllButton.Location = New-Object System.Drawing.Point(200, 65)
 $deselectAllButton.Size = New-Object System.Drawing.Size(75, 30)
 $deselectAllButton.Anchor = "Top,Left"  # 上左に固定
-# 再帰的なチェック解除処理
+# 再帰的なチェック解除処理（ScriptBlockとして定義してスコープ汚染を防止）
 $deselectAllButton.Add_Click({
-    function Set-AllNodes {
+    $setAllNodes = {
         param($Node, $Checked)
         $Node.Checked = $Checked       # 現在のノードをチェック解除
         foreach ($child in $Node.Nodes) {
-            Set-AllNodes -Node $child -Checked $Checked # 子ノードを再帰処理
+            # 再帰呼び出し（& 演算子でScriptBlockを実行）
+            & $setAllNodes -Node $child -Checked $Checked
         }
     }
-    
+
     foreach ($node in $treeView.Nodes) {
-        Set-AllNodes -Node $node -Checked $false # falseで全解除
+        & $setAllNodes -Node $node -Checked $false # falseで全解除
     }
 })
 $form.Controls.Add($deselectAllButton)
@@ -688,17 +742,19 @@ $treeView.CheckBoxes = $true
 $treeView.Anchor = "Top,Left,Bottom"  # 高さを伸縮
 $treeView.Add_AfterCheck({
     param($sender, $e)
-    
-    function Set-ChildNodes {
+
+    # ScriptBlockとして定義してスコープ汚染を防止
+    $setChildNodes = {
         param($Node, $Checked)
         foreach ($child in $Node.Nodes) {
             $child.Checked = $Checked
-            Set-ChildNodes -Node $child -Checked $Checked
+            # 再帰呼び出し（& 演算子でScriptBlockを実行）
+            & $setChildNodes -Node $child -Checked $Checked
         }
     }
-    
+
     if ($e.Node) {
-        Set-ChildNodes -Node $e.Node -Checked $e.Node.Checked
+        & $setChildNodes -Node $e.Node -Checked $e.Node.Checked
     }
 })
 $form.Controls.Add($treeView)
@@ -727,15 +783,34 @@ $previewTextBox.Anchor = "Top,Left,Bottom,Right"  # 縦横両方向に伸縮
 $form.Controls.Add($previewTextBox)
 
 ###############################################################
+# コメント設定用ComboBox
+# - コメント記号スタイル選択
+###############################################################
+
+# ComboBox: コメント記号スタイル選択
+$comboBoxCommentStyle = New-Object System.Windows.Forms.ComboBox
+$comboBoxCommentStyle.Location = New-Object System.Drawing.Point(10, 530)
+$comboBoxCommentStyle.Size = New-Object System.Drawing.Size(140, 25)
+$comboBoxCommentStyle.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+$comboBoxCommentStyle.Anchor = "Bottom,Left"
+$comboBoxCommentStyle.Items.AddRange(@(
+    "//",
+    "#",
+    "コメントなし"
+))
+$comboBoxCommentStyle.SelectedIndex = 0  # デフォルト: //
+$form.Controls.Add($comboBoxCommentStyle)
+
+###############################################################
 # ツリー生成ボタン
 # - チェック状態をFileSystemNodeに反映
-# - 折りたたまれたノードの子要素は出力しない（無効化）
-# - ツリー生成・編集エリアに表示
+# - 折りたたまれた子ノードは出力に含めない
+# - 生成したツリーを編集エリアに表示
 ###############################################################
 
 $generateButton = New-Object System.Windows.Forms.Button
 $generateButton.Text = "ツリー生成"
-$generateButton.Location = New-Object System.Drawing.Point(10, 530)
+$generateButton.Location = New-Object System.Drawing.Point(160, 530)
 $generateButton.Size = New-Object System.Drawing.Size(120, 30)
 $generateButton.BackColor = [System.Drawing.Color]::LightBlue
 $generateButton.Anchor = "Bottom,Left"  # 下に固定
@@ -750,8 +825,9 @@ $generateButton.Add_Click({
         return
     }
 
-    # 修正版：展開状態を考慮したチェック状態更新関数
-    function Update-NodeCheckedState {
+    # 修正版：ツリービューの展開状態を考慮してチェック状態を更新する
+    # 親ノードが折りたたまれている場合、その配下の子ノードはすべて非選択として扱う
+    $updateNodeCheckedState = {
         param(
             $TreeNode,
             [bool]$ParentIsExpanded = $true  # 親が展開されているかどうか
@@ -774,18 +850,29 @@ $generateButton.Add_Click({
             # - 折りたたまれている場合（IsExpanded = false）、子要素は全て無効
             $childShouldBeActive = $ParentIsExpanded -and $TreeNode.IsExpanded
 
-            Update-NodeCheckedState -TreeNode $child -ParentIsExpanded $childShouldBeActive
+            # 再帰呼び出し（& 演算子でScriptBlockを実行）
+            & $updateNodeCheckedState -TreeNode $child -ParentIsExpanded $childShouldBeActive
         }
     }
 
     # ルートノードから処理開始
     foreach ($node in $treeView.Nodes) {
         # ルートノードは常に有効（ParentIsExpanded = true）
-        Update-NodeCheckedState -TreeNode $node -ParentIsExpanded $true
+        & $updateNodeCheckedState -TreeNode $node -ParentIsExpanded $true
+    }
+
+    # ComboBoxから選択値を取得
+    $selectedCommentStyle = switch ($comboBoxCommentStyle.SelectedItem.ToString()) {
+        "//" { "//" }
+        "#" { "#" }
+        "コメントなし" { "None" }
+        default { "//" }
     }
 
     # ツリー生成
-    $treeOutput = ConvertTo-TreeOutput -Node $script:rootNode
+    $treeOutput = ConvertTo-TreeOutput `
+        -Node $script:rootNode `
+        -CommentStyle $selectedCommentStyle
     $previewTextBox.Text = $treeOutput
     $statusLabel.Text = "ツリー生成完了"
 })
@@ -797,7 +884,7 @@ $form.Controls.Add($generateButton)
 ###############################################################
 $copyButton = New-Object System.Windows.Forms.Button
 $copyButton.Text = "クリップボードにコピー"
-$copyButton.Location = New-Object System.Drawing.Point(140, 530)
+$copyButton.Location = New-Object System.Drawing.Point(290, 530)
 $copyButton.Size = New-Object System.Drawing.Size(150, 30)
 $copyButton.Anchor = "Bottom,Left"  # 下に固定
 $copyButton.Add_Click({
@@ -828,13 +915,13 @@ $copyButton.Add_Click({
 $form.Controls.Add($copyButton)
 
 ###############################################################
-# 使用方法ラベル（コンパクト化）
+# 使用方法ラベル
 # - ユーザー向けの簡易説明
 ###############################################################
 $helpLabel = New-Object System.Windows.Forms.Label
 $helpLabel.Text = @"
 使用方法:
-1. パスを入力（Windows: D:\folder、WSL: /home/user または \\wsl.localhost\Ubuntu\path）
+1. パスを入力（例: D:\folder, /home/user, \\wsl.localhost\Ubuntu\home, \\wsl$\Ubuntu\home）
 2. [読み込み]をクリックしてフォルダ構造を取得
 3. 出力したい項目にチェック（親をチェックすると子も自動選択）
 4. [ツリー生成]をクリックして出力を作成
@@ -850,7 +937,7 @@ $form.Controls.Add($helpLabel)
 
 
 ###############################################################
-# ステータスバー（StatusStripに変更）
+# ステータスバー
 # - 現在の状態を表示
 ###############################################################
 $statusStrip = New-Object System.Windows.Forms.StatusStrip
