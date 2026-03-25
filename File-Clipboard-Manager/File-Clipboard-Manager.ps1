@@ -1,16 +1,11 @@
 <#
 .SYNOPSIS
-    File Clipboard Manager - ファイルをクリップボードに登録するツール
-
-.DESCRIPTION
-    複数のファイルをグループ管理し、クリップボードに一括登録できるツールです。
-    ファイルパス方式とフェンス付きテキスト方式の2つの登録方法をサポートします。
+    File Clipboard Manager - プロジェクトフォルダのファイルをクリップボードに登録するツール
 
 .NOTES
     Author: ya-man
-    Version: 1.1
-    Date: 2025-11-03
-    Requires: PowerShell 5.1 or later, Windows Forms
+    Version: 2.0
+    Requires: PowerShell 5.1 or later, Windows Forms, Python + pathspec
 #>
 
 # ================================================================================
@@ -22,106 +17,223 @@ Add-Type -AssemblyName System.Drawing
 # ================================================================================
 # グローバル変数
 # ================================================================================
-$script:config = $null
-$script:configPath = Join-Path $PSScriptRoot "config.json"
-$script:messageLabel = $null
-
-# ================================================================================
-# ヘルパー関数: 表示形式変換
-# ================================================================================
-
-<#
-.SYNOPSIS
-    ファイルパスを表示用フォーマットに変換
-.DESCRIPTION
-    フルパスを "ファイル名":"フルパス" 形式に変換します。
-    同名ファイルの識別を容易にするための表示用フォーマットです。
-#>
-function ConvertTo-DisplayFormat($filePath) {
-    $fileName = [System.IO.Path]::GetFileName($filePath)
-    return "`"$fileName`":`"$filePath`""
-}
-
-<#
-.SYNOPSIS
-    表示用フォーマットからファイルパスを抽出
-.DESCRIPTION
-    "ファイル名":"フルパス" 形式からフルパスを抽出します。
-    正規表現で2つ目のダブルクォート内の文字列を取得します。
-#>
-function ConvertFrom-DisplayFormat($displayText) {
-    if ($displayText -match '^"[^"]+":"(.+)"') {
-        return $matches[1]
-    }
-    return $displayText
-}
+$script:currentFolder      = ""
+$script:currentFiles       = @()
+$script:folderHistory      = @()
+$script:gitignoreEnabled   = $true
+$script:settingsPath       = Join-Path $PSScriptRoot "settings.json"
+$script:filterScriptPath   = Join-Path $PSScriptRoot "filter.py"
+$script:messageLabel       = $null
+$script:notifyIcon         = $null
 
 # ================================================================================
 # 設定ファイル操作
 # ================================================================================
 
-<#
-.SYNOPSIS
-    設定ファイルの読み込み
-.DESCRIPTION
-    config.jsonから設定を読み込みます。
-    ファイルが存在しない場合はデフォルト設定を作成します。
-#>
-function Load-Config {
-    if (Test-Path $script:configPath) {
-        try {
-            $json = Get-Content $script:configPath -Raw -Encoding UTF8
-            $script:config = $json | ConvertFrom-Json
-        }
-        catch {
-            [System.Windows.Forms.MessageBox]::Show(
-                "設定ファイルの読み込みに失敗しました。デフォルト設定を使用します。`n`nエラー: $_",
-                "エラー",
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Warning
+function Load-Settings {
+    # settings.json が存在しない場合はデフォルト値で自動生成
+    if (-not (Test-Path $script:settingsPath)) {
+        $defaultSettings = @{
+            gitignore_enabled  = $true
+            folder_history     = @()
+            exclude_extensions = @(
+                ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".ico", ".webp",
+                ".tiff", ".tif", ".psd", ".ai", ".eps", ".raw", ".heic", ".avif", ".icns",
+                ".mp4", ".mp3", ".wav", ".flac", ".aac", ".ogg", ".avi", ".mov",
+                ".mkv", ".wmv", ".m4a", ".m4v", ".webm", ".wma", ".m4p", ".3gp",
+                ".exe", ".dll", ".so", ".dylib", ".bin", ".obj", ".class",
+                ".apk", ".aab", ".ipa", ".jar", ".war", ".ear", ".jmod",
+                ".zip", ".tar", ".gz", ".7z", ".rar", ".bz2", ".xz",
+                ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                ".db", ".sqlite", ".sqlite3",
+                ".o", ".a", ".lib", ".pyc", ".pyo"
             )
-            $script:config = @{
-                groups = @(
-                    @{ name = "グループ1"; files = @() },
-                    @{ name = "グループ2"; files = @() },
-                    @{ name = "グループ3"; files = @() },
-                    @{ name = "グループ4"; files = @() }
+            exclude_filenames  = @(
+                "Cargo.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+                "poetry.lock", "Pipfile.lock", "Gemfile.lock", "composer.lock",
+                "go.sum", "packages.lock.json", "Package.resolved", "pubspec.lock"
+            )
+        }
+        $defaultSettings | ConvertTo-Json -Depth 10 | Set-Content $script:settingsPath -Encoding UTF8
+    }
+
+    if (Test-Path $script:settingsPath) {
+        try {
+            $json = Get-Content $script:settingsPath -Raw -Encoding UTF8
+            $settings = $json | ConvertFrom-Json
+            $script:gitignoreEnabled = $settings.gitignore_enabled
+
+            $needsSave = $false
+
+            # マイグレーション: last_folder → folder_history
+            if ($null -eq $settings.folder_history -and $null -ne $settings.last_folder) {
+                $settings | Add-Member -NotePropertyName "folder_history" -NotePropertyValue @($settings.last_folder)
+                $settings.PSObject.Properties.Remove('last_folder')
+                $needsSave = $true
+            }
+
+            # folder_history の読み込み
+            if ($null -ne $settings.folder_history) {
+                $script:folderHistory = @($settings.folder_history)
+                if ($script:folderHistory.Count -gt 0) {
+                    $script:currentFolder = $script:folderHistory[0]
+                }
+            }
+
+            # 除外ルールのキーが必須
+            if ($null -eq $settings.exclude_extensions -or $null -eq $settings.exclude_filenames) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "settings.json に exclude_extensions または exclude_filenames がありません。`nsettings.json を確認してください。",
+                    "設定エラー",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
+                    [System.Windows.Forms.MessageBoxIcon]::Error
                 )
+                exit
+            }
+
+            if ($needsSave) {
+                $settings | ConvertTo-Json -Depth 10 | Set-Content $script:settingsPath -Encoding UTF8
             }
         }
-    }
-    else {
-        # デフォルト設定の作成
-        $script:config = @{
-            groups = @(
-                @{ name = "グループ1"; files = @() },
-                @{ name = "グループ2"; files = @() },
-                @{ name = "グループ3"; files = @() },
-                @{ name = "グループ4"; files = @() }
-            )
+        catch {
+            $script:currentFolder    = ""
+            $script:gitignoreEnabled = $true
         }
-        Save-Config
     }
 }
 
-<#
-.SYNOPSIS
-    設定ファイルの保存
-.DESCRIPTION
-    現在の$script:configをJSON形式でconfig.jsonに保存します。
-#>
-function Save-Config {
+function Save-Settings {
     try {
-        $json = $script:config | ConvertTo-Json -Depth 10
-        $json | Set-Content $script:configPath -Encoding UTF8
+        if (Test-Path $script:settingsPath) {
+            $json = Get-Content $script:settingsPath -Raw -Encoding UTF8
+            $settings = $json | ConvertFrom-Json
+            $settings.folder_history = $script:folderHistory
+            $settings.gitignore_enabled = $script:gitignoreEnabled
+
+            # マイグレーション済み確認: last_folder が残っていたら削除
+            if ($null -ne $settings.last_folder) {
+                $settings.PSObject.Properties.Remove('last_folder')
+            }
+        }
+        else {
+            $settings = @{
+                folder_history     = $script:folderHistory
+                gitignore_enabled  = $script:gitignoreEnabled
+                exclude_extensions = @(
+                    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".ico", ".webp",
+                    ".tiff", ".tif", ".psd", ".ai", ".eps", ".raw", ".heic", ".avif", ".icns",
+                    ".mp4", ".mp3", ".wav", ".flac", ".aac", ".ogg", ".avi", ".mov",
+                    ".mkv", ".wmv", ".m4a", ".m4v", ".webm", ".wma", ".m4p", ".3gp",
+                    ".exe", ".dll", ".so", ".dylib", ".bin", ".obj", ".class",
+                    ".apk", ".aab", ".ipa", ".jar", ".war", ".ear", ".jmod",
+                    ".zip", ".tar", ".gz", ".7z", ".rar", ".bz2", ".xz",
+                    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                    ".db", ".sqlite", ".sqlite3",
+                    ".o", ".a", ".lib", ".pyc", ".pyo"
+                )
+                exclude_filenames  = @(
+                    "Cargo.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+                    "poetry.lock", "Pipfile.lock", "Gemfile.lock", "composer.lock",
+                    "go.sum", "packages.lock.json", "Package.resolved", "pubspec.lock"
+                )
+            }
+        }
+        $settings | ConvertTo-Json -Depth 10 | Set-Content $script:settingsPath -Encoding UTF8
+    }
+    catch {
+        Show-Message "設定の保存に失敗しました: $_"
+    }
+}
+
+function Add-FolderHistory($folderPath) {
+    # 既に履歴にある場合は一度削除して先頭に移動
+    $script:folderHistory = @($folderPath) + @($script:folderHistory | Where-Object { $_ -ne $folderPath })
+
+    # 上限10件に切り詰め
+    if ($script:folderHistory.Count -gt 10) {
+        $script:folderHistory = $script:folderHistory[0..9]
+    }
+}
+
+# ================================================================================
+# 起動時チェック
+# ================================================================================
+
+function Test-Requirements {
+    # Pythonチェック
+    try {
+        $null = & python --version 2>&1
+        if ($LASTEXITCODE -ne 0) { throw }
     }
     catch {
         [System.Windows.Forms.MessageBox]::Show(
-            "設定ファイルの保存に失敗しました。`n`nエラー: $_",
-            "エラー",
+            "Pythonが見つかりません。`nPythonをインストールしてください。",
+            "起動エラー",
             [System.Windows.Forms.MessageBoxButtons]::OK,
             [System.Windows.Forms.MessageBoxIcon]::Error
         )
+        return $false
+    }
+
+    # pathspecチェック
+    try {
+        $null = & python -c "import pathspec" 2>&1
+        if ($LASTEXITCODE -ne 0) { throw }
+    }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "pathspecが見つかりません。`n以下のコマンドを実行してください:`n`npip install pathspec",
+            "起動エラー",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        )
+        return $false
+    }
+
+    return $true
+}
+
+# ================================================================================
+# フィルタリング
+# ================================================================================
+
+function Invoke-Filter {
+    if ([string]::IsNullOrEmpty($script:currentFolder)) {
+        return @()
+    }
+
+    if (-not (Test-Path $script:currentFolder)) {
+        Show-Message "フォルダが見つかりません: $script:currentFolder"
+        return @()
+    }
+
+    # .gitignore チェック
+    if ($script:gitignoreEnabled) {
+        $gitignorePath = Join-Path $script:currentFolder ".gitignore"
+        if (-not (Test-Path $gitignorePath)) {
+            Show-Message ".gitignoreが見つかりません。チェックをOFFにするか、.gitignoreを作成してください。"
+            return @()
+        }
+    }
+
+    try {
+        $filterArgs = @($script:filterScriptPath, $script:currentFolder)
+        if (-not $script:gitignoreEnabled) {
+            $filterArgs += "--no-gitignore"
+        }
+
+        $output = & python @filterArgs 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $errMsg = $output | Where-Object { $_ -match "^ERROR:" }
+            Show-Message "フィルタリングエラー: $errMsg"
+            return @()
+        }
+
+        return @($output | Where-Object { $_ -ne "" })
+    }
+    catch {
+        Show-Message "filter.py の実行に失敗しました: $_"
+        return @()
     }
 }
 
@@ -129,115 +241,85 @@ function Save-Config {
 # ファイルサイズ計算
 # ================================================================================
 
-<#
-.SYNOPSIS
-    グループ内のファイル合計サイズを計算
-.DESCRIPTION
-    指定グループの全ファイルサイズを合計し、MB単位で返します。
-    存在しないファイルはスキップします。
-#>
-function Get-GroupSize($groupIndex) {
+function Get-TotalSize($files) {
     $totalBytes = 0
-    foreach ($filePath in $script:config.groups[$groupIndex].files) {
-        if (Test-Path $filePath) {
-            $totalBytes += (Get-Item $filePath).Length
+    foreach ($f in $files) {
+        if (Test-Path $f) {
+            $totalBytes += (Get-Item $f).Length
         }
     }
-    $totalMB = $totalBytes / 1MB
-    return "{0:N1} MB" -f $totalMB
+    return "{0:N1} MB" -f ($totalBytes / 1MB)
 }
 
 # ================================================================================
-# BOM付きUTF-8変換
+# クリップボード操作
 # ================================================================================
 
-<#
-.SYNOPSIS
-    選択ファイルをBOM付きUTF-8に変換
-.DESCRIPTION
-    指定されたファイルをBOM付きUTF-8エンコーディングで再保存します。
-    バックアップは作成されないため注意が必要です。
-#>
-function Convert-ToBomUtf8($groupIndex) {
-    # このバージョンでは使用されていません（設定ウィンドウから直接処理）
-}
-
-# ================================================================================
-# クリップボード登録（ファイルパス方式）
-# ================================================================================
-
-<#
-.SYNOPSIS
-    ファイルパスをクリップボードに登録
-.DESCRIPTION
-    指定グループのファイルパスをクリップボードに登録します。
-    エクスプローラーに貼り付け可能な形式（FileDropList）で登録されます。
-#>
-function Set-ClipboardFiles($groupIndex) {
-    $files = $script:config.groups[$groupIndex].files
-    $groupName = $script:config.groups[$groupIndex].name
-
-    $fileCollection = New-Object System.Collections.Specialized.StringCollection
-
-    foreach ($filePath in $files) {
-        if (Test-Path $filePath) {
-            [void]$fileCollection.Add($filePath)
-        }
+function Set-ClipboardFiles($files) {
+    $col = New-Object System.Collections.Specialized.StringCollection
+    foreach ($f in $files) {
+        if (Test-Path $f) { [void]$col.Add($f) }
     }
-
-    [System.Windows.Forms.Clipboard]::SetFileDropList($fileCollection)
-    Show-Message "クリップボードに登録しました（$groupName、$($fileCollection.Count)件）"
+    if ($col.Count -eq 0) {
+        Show-Message "対象ファイルがありません"
+        return
+    }
+    [System.Windows.Forms.Clipboard]::SetFileDropList($col)
+    Show-Message "クリップボードに登録しました（$($col.Count)件）"
 }
 
-# ================================================================================
-# クリップボード登録（個別ファイルのフェンス付きテキスト方式）
-# ================================================================================
-
-<#
-.SYNOPSIS
-    個別ファイルをフェンス付きテキストとしてクリップボードに登録
-.DESCRIPTION
-    ファイル内容をMarkdownコードフェンス（```）で囲んでクリップボードに登録します。
-    AIチャットツールへのコード送信に便利です。
-#>
-function Set-ClipboardTextWithFence($filePath) {
-    if (-not (Test-Path $filePath)) {
-        Show-Message "ファイルが見つかりません: $filePath"
+function Set-ClipboardWithFence($files) {
+    if ($files.Count -eq 0) {
+        Show-Message "対象ファイルがありません"
         return
     }
 
-    try {
-        $content = Get-Content $filePath -Raw -Encoding UTF8
-        $fence = '```'
-        $text = $fence + "`n" + $content + "`n" + $fence
+    $fence = '```'
+    $allText = ""
+    $count = 0
+    $skipCount = 0
 
-        [System.Windows.Forms.Clipboard]::SetText($text)
-
-        $fileName = [System.IO.Path]::GetFileName($filePath)
-        Show-Message "$fileName にフェンスを追加してクリップボードに登録しました"
+    foreach ($f in $files) {
+        if (-not (Test-Path $f)) { continue }
+        try {
+            $content = Get-Content $f -Raw -Encoding UTF8
+            $allText += "ファイルパス: $f`n"
+            $allText += $fence + "`n"
+            $allText += $content + "`n"
+            $allText += $fence + "`n`n"
+            $count++
+        }
+        catch { $skipCount++ }
     }
-    catch {
-        Show-Message "ファイルの読み込みに失敗しました: $_"
+
+    if ($allText.Length -eq 0) {
+        Show-Message "読み込めるファイルがありません"
+        return
+    }
+
+    [System.Windows.Forms.Clipboard]::SetText($allText)
+    if ($skipCount -gt 0) {
+        Show-Message "フェンス付きでクリップボードに登録しました（${count}件、${skipCount}件スキップ）"
+    }
+    else {
+        Show-Message "フェンス付きでクリップボードに登録しました（${count}件）"
     }
 }
 
-<#
-.SYNOPSIS
-    クリップボードの内容をフェンス付きテキストに変換
-.DESCRIPTION
-    クリップボード内のファイルまたはテキストをフェンス付きテキストに変換します。
-    ファイルとテキストの両方に対応し、設定ウィンドウへの登録なしで使用できます。
-#>
-function Set-ClipboardFileWithFence {
-    # クリップボードからファイルリストを取得
+function Set-ClipboardAddFence {
+    $textExtensions = @(
+        '.txt','.ps1','.psm1','.psd1','.cs','.vb','.js','.ts','.tsx','.jsx',
+        '.html','.htm','.xml','.json','.css','.md','.log','.csv','.ini',
+        '.config','.bat','.cmd','.py','.rb','.java','.c','.cpp','.h','.hpp',
+        '.php','.sh','.rs','.toml','.yaml','.yml'
+    )
+
     $fileList = [System.Windows.Forms.Clipboard]::GetFileDropList()
 
-    # ファイル形式が入っている場合
     if ($null -ne $fileList -and $fileList.Count -gt 0) {
-        # エラーチェック1: 複数ファイルでないか
         if ($fileList.Count -gt 1) {
             [System.Windows.Forms.MessageBox]::Show(
-                "複数ファイルには対応していません。1つのファイルを選択してください",
+                "複数ファイルには対応していません。1つのファイルをコピーしてください。",
                 "エラー",
                 [System.Windows.Forms.MessageBoxButtons]::OK,
                 [System.Windows.Forms.MessageBoxIcon]::Warning
@@ -247,165 +329,89 @@ function Set-ClipboardFileWithFence {
 
         $filePath = $fileList[0]
 
-        # エラーチェック2: ファイルが存在するか
         if (-not (Test-Path $filePath)) {
-            [System.Windows.Forms.MessageBox]::Show(
-                "ファイルが見つかりません",
-                "エラー",
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Error
-            )
+            Show-Message "ファイルが見つかりません"
             return
         }
-
-        # エラーチェック3: テキストファイルか（拡張子チェック）
-        $textExtensions = @('.txt', '.ps1', '.psm1', '.psd1', '.cs', '.vb', '.js', '.ts',
-                            '.html', '.htm', '.xml', '.json', '.css', '.md', '.log',
-                            '.csv', '.ini', '.config', '.bat', '.cmd', '.py', '.rb',
-                            '.java', '.c', '.cpp', '.h', '.hpp', '.php', '.sh')
 
         $ext = [System.IO.Path]::GetExtension($filePath).ToLower()
-
         if ($textExtensions -notcontains $ext) {
-            [System.Windows.Forms.MessageBox]::Show(
-                "テキストファイルではありません",
-                "エラー",
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Warning
-            )
+            Show-Message "テキストファイルではありません"
             return
         }
 
-        # エラーチェック4: ファイルサイズが30MB以下か
         $fileSize = (Get-Item $filePath).Length
-        $maxSize = 30MB
-
-        if ($fileSize -gt $maxSize) {
-            [System.Windows.Forms.MessageBox]::Show(
-                "ファイルサイズが30MBを超えています",
-                "エラー",
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Warning
-            )
+        if ($fileSize -gt 30MB) {
+            Show-Message "ファイルサイズが30MBを超えています"
             return
         }
 
-        # ファイル内容を読み込み＋フェンスで囲む
         try {
             $content = Get-Content $filePath -Raw -Encoding UTF8
             $fence = '```'
-            $text = $fence + "`n" + $content + "`n" + $fence
-
-            # クリップボードに再登録
+            $text = "ファイルパス: $filePath`n" + $fence + "`n" + $content + "`n" + $fence
             [System.Windows.Forms.Clipboard]::SetText($text)
-
-            # 成功メッセージ
             $fileName = [System.IO.Path]::GetFileName($filePath)
             Show-Message "$fileName にフェンスを追加してクリップボードに登録しました"
         }
         catch {
-            [System.Windows.Forms.MessageBox]::Show(
-                "ファイルの読み込みに失敗しました: $_",
-                "エラー",
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Error
-            )
+            Show-Message "ファイルの読み込みに失敗しました: $_"
         }
         return
     }
 
-    # テキスト形式が入っている場合
     if ([System.Windows.Forms.Clipboard]::ContainsText()) {
-        try {
-            $content = [System.Windows.Forms.Clipboard]::GetText()
-
-            # 空のテキストチェック
-            if ([string]::IsNullOrWhiteSpace($content)) {
-                [System.Windows.Forms.MessageBox]::Show(
-                    "クリップボードのテキストが空です",
-                    "エラー",
-                    [System.Windows.Forms.MessageBoxButtons]::OK,
-                    [System.Windows.Forms.MessageBoxIcon]::Warning
-                )
-                return
-            }
-
-            # フェンスで囲む
-            $fence = '```'
-            $text = $fence + "`n" + $content + "`n" + $fence
-
-            # クリップボードに再登録
-            [System.Windows.Forms.Clipboard]::SetText($text)
-
-            # 成功メッセージ
-            Show-Message "テキストにフェンスを追加してクリップボードに登録しました"
+        $content = [System.Windows.Forms.Clipboard]::GetText()
+        if ([string]::IsNullOrWhiteSpace($content)) {
+            Show-Message "クリップボードのテキストが空です"
+            return
         }
-        catch {
-            [System.Windows.Forms.MessageBox]::Show(
-                "テキストの処理に失敗しました: $_",
-                "エラー",
-                [System.Windows.Forms.MessageBoxButtons]::OK,
-                [System.Windows.Forms.MessageBoxIcon]::Error
-            )
-        }
+        $fence = '```'
+        $text = $fence + "`n" + $content + "`n" + $fence
+        [System.Windows.Forms.Clipboard]::SetText($text)
+        Show-Message "テキストにフェンスを追加してクリップボードに登録しました"
         return
     }
 
-    # ファイルもテキストも入っていない場合
-    [System.Windows.Forms.MessageBox]::Show(
-        "クリップボードにファイルまたはテキストがコピーされていません",
-        "エラー",
-        [System.Windows.Forms.MessageBoxButtons]::OK,
-        [System.Windows.Forms.MessageBoxIcon]::Warning
-    )
+    Show-Message "クリップボードにファイルまたはテキストがありません"
 }
 
 # ================================================================================
-# クリップボード登録（グループ全体のフェンス付きテキスト方式）
+# BOM変換
 # ================================================================================
 
-<#
-.SYNOPSIS
-    グループ全体をフェンス付きテキストとしてクリップボードに登録
-.DESCRIPTION
-    グループ内の全ファイルをフェンス付きテキストとして連結し、
-    クリップボードに登録します。各ファイルの先頭にファイル名を記載します。
-#>
-function Set-ClipboardGroupTextWithFence($groupIndex) {
-    $files = $script:config.groups[$groupIndex].files
-    $groupName = $script:config.groups[$groupIndex].name
-    $allText = ""
-    $fence = '```'
-    $processedCount = 0
+function Convert-ToBomUtf8($filePath) {
+    $textExtensions = @(
+        '.txt','.ps1','.psm1','.psd1','.cs','.vb','.js','.ts','.tsx','.jsx',
+        '.html','.htm','.xml','.json','.css','.md','.log','.csv','.ini',
+        '.config','.bat','.cmd','.py','.rb','.java','.c','.cpp','.h','.hpp',
+        '.php','.sh','.rs','.toml','.yaml','.yml'
+    )
 
-    foreach ($filePath in $files) {
-        if (-not (Test-Path $filePath)) {
-            continue
-        }
+    $ext = [System.IO.Path]::GetExtension($filePath).ToLower()
+    if ($textExtensions -notcontains $ext) {
+        Show-Message "テキストファイルではありません"
+        return
+    }
 
+    $fileName = [System.IO.Path]::GetFileName($filePath)
+    $result = [System.Windows.Forms.MessageBox]::Show(
+        "$fileName をBOM付きUTF-8に変換しますか？`n`n※バックアップは作成されません",
+        "確認",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Question
+    )
+
+    if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
         try {
-            $content = Get-Content $filePath -Raw -Encoding UTF8
-            $fileName = [System.IO.Path]::GetFileName($filePath)
-
-            # ファイル名 + コードフェンス + 内容 + コードフェンス + 空行
-            $allText += $fileName + "`n"
-            $allText += $fence + "`n"
-            $allText += $content + "`n"
-            $allText += $fence + "`n`n"
-
-            $processedCount++
+            $content = Get-Content $filePath -Raw
+            $utf8Bom = New-Object System.Text.UTF8Encoding($true)
+            [System.IO.File]::WriteAllText($filePath, $content, $utf8Bom)
+            Show-Message "$fileName : BOM変換完了"
         }
         catch {
-            # エラーは無視して次のファイルへ
+            Show-Message "変換に失敗しました: $_"
         }
-    }
-
-    if ($allText.Length -gt 0) {
-        [System.Windows.Forms.Clipboard]::SetText($allText)
-        Show-Message "$groupName の全ファイル（${processedCount}件）をフェンス付きでクリップボードに登録しました"
-    }
-    else {
-        Show-Message "登録可能なファイルがありません"
     }
 }
 
@@ -413,477 +419,303 @@ function Set-ClipboardGroupTextWithFence($groupIndex) {
 # メッセージ表示
 # ================================================================================
 
-<#
-.SYNOPSIS
-    メッセージ表示エリアにメッセージを表示
-.DESCRIPTION
-    メインウィンドウ下部のラベルにメッセージを表示します。
-#>
 function Show-Message($message) {
-    if ($script:messageLabel -ne $null) {
+    if ($null -ne $script:messageLabel) {
         $script:messageLabel.Text = $message
     }
 }
 
 # ================================================================================
-# ファイル移動
+# ファイル詳細ウィンドウ
 # ================================================================================
 
-<#
-.SYNOPSIS
-    ファイルを別グループへ移動
-.DESCRIPTION
-    指定されたファイルをソースグループからターゲットグループへ移動します。
-    ターゲットグループが20ファイル上限に達している場合はエラーを表示します。
-#>
-function Move-FileToGroup($sourceGroupIndex, $fileIndex, $targetGroupIndex) {
-    if ($script:config.groups[$targetGroupIndex].files.Count -ge 20) {
-        Show-Message "移動先グループは既に20ファイル登録されています"
-        return $false
+function Show-FileDetailWindow {
+    if ($script:currentFiles.Count -eq 0) {
+        Show-Message "ファイルがありません"
+        return
     }
 
-    $filePath = $script:config.groups[$sourceGroupIndex].files[$fileIndex]
+    $detailForm = New-Object System.Windows.Forms.Form
+    $detailForm.Text = "ファイル詳細"
+    $detailForm.Size = New-Object System.Drawing.Size(700, 500)
+    $detailForm.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $detailForm.MaximizeBox = $false
+    $detailForm.MinimizeBox = $false
+    $detailForm.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
 
-    # ソースから削除
-    $script:config.groups[$sourceGroupIndex].files = @(
-        $script:config.groups[$sourceGroupIndex].files | Where-Object { $_ -ne $filePath }
-    )
-
-    # ターゲットに追加
-    $script:config.groups[$targetGroupIndex].files += $filePath
-
-    $targetGroupName = $script:config.groups[$targetGroupIndex].name
-    Show-Message "ファイルを $targetGroupName へ移動しました"
-
-    return $true
-}
-
-# ================================================================================
-# メインウィンドウ構築
-# ================================================================================
-
-<#
-.SYNOPSIS
-    メインウィンドウの表示
-.DESCRIPTION
-    4つのグループを管理するメインUIを構築・表示します。
-#>
-function Show-MainWindow {
-    $form = New-Object System.Windows.Forms.Form
-    $form.Text = "File Clipboard Manager"
-    $form.Size = New-Object System.Drawing.Size(450, 430)
-    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
-    $form.MaximizeBox = $false
-    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-
-    # グループごとのUI要素を格納する配列
-    $groupLabels = @()
-    $sizeLabels = @()
-
-    # 4グループ分のUIを作成
-    for ($i = 0; $i -lt 4; $i++) {
-        $yPos = 10 + ($i * 70)
-
-        # グループ名ラベル
-        $lblGroup = New-Object System.Windows.Forms.Label
-        $lblGroup.Text = $script:config.groups[$i].name
-        $lblGroup.Location = New-Object System.Drawing.Point(10, $yPos)
-        $lblGroup.Size = New-Object System.Drawing.Size(200, 20)
-        $form.Controls.Add($lblGroup)
-        $groupLabels += $lblGroup
-
-        # ファイルサイズラベル
-        $lblSize = New-Object System.Windows.Forms.Label
-        $lblSize.Text = Get-GroupSize $i
-        $lblSize.Location = New-Object System.Drawing.Point(320, $yPos)
-        $lblSize.Size = New-Object System.Drawing.Size(100, 20)
-        $lblSize.TextAlign = [System.Drawing.ContentAlignment]::TopRight
-        $form.Controls.Add($lblSize)
-        $sizeLabels += $lblSize
-
-        # 設定ボタン
-        $btnConfig = New-Object System.Windows.Forms.Button
-        $btnConfig.Text = "設定"
-        $btnConfig.Location = New-Object System.Drawing.Point(10, ($yPos + 25))
-        $btnConfig.Size = New-Object System.Drawing.Size(100, 25)
-        $btnConfig.Tag = $i
-        $btnConfig.Add_Click({
-            Show-ConfigWindow $this.Tag $groupLabels $sizeLabels
-        })
-        $form.Controls.Add($btnConfig)
-
-        # クリップボードへボタン（ファイルパス方式）
-        $btnClipboard = New-Object System.Windows.Forms.Button
-        $btnClipboard.Text = "クリップボードへ"
-        $btnClipboard.Location = New-Object System.Drawing.Point(120, ($yPos + 25))
-        $btnClipboard.Size = New-Object System.Drawing.Size(130, 25)
-        $btnClipboard.Tag = $i
-        $btnClipboard.Add_Click({
-            Set-ClipboardFiles $this.Tag
-        })
-        $form.Controls.Add($btnClipboard)
-
-        # フェンス付きでクリップボードボタン（テキスト方式）
-        $btnFence = New-Object System.Windows.Forms.Button
-        $btnFence.Text = "フェンス付きでクリップボード"
-        $btnFence.Location = New-Object System.Drawing.Point(260, ($yPos + 25))
-        $btnFence.Size = New-Object System.Drawing.Size(170, 25)
-        $btnFence.Tag = $i
-        $btnFence.Add_Click({
-            Set-ClipboardGroupTextWithFence $this.Tag
-        })
-        $form.Controls.Add($btnFence)
-    }
-
-    # クリップボードにフェンス追加ボタン
-    $btnClipboardFence = New-Object System.Windows.Forms.Button
-    $btnClipboardFence.Text = "クリップボードにフェンス追加"
-    $btnClipboardFence.Location = New-Object System.Drawing.Point(10, 290)
-    $btnClipboardFence.Size = New-Object System.Drawing.Size(250, 30)
-    $btnClipboardFence.Add_Click({
-        Set-ClipboardFileWithFence
-    })
-    $form.Controls.Add($btnClipboardFence)
-
-    # メッセージ表示エリア
-    $script:messageLabel = New-Object System.Windows.Forms.Label
-    $script:messageLabel.Text = ""
-    $script:messageLabel.Location = New-Object System.Drawing.Point(10, 340)
-    $script:messageLabel.Size = New-Object System.Drawing.Size(420, 30)
-    $script:messageLabel.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
-    $script:messageLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
-    $form.Controls.Add($script:messageLabel)
-
-    [void]$form.ShowDialog()
-}
-
-# ================================================================================
-# 設定ウィンドウ構築
-# ================================================================================
-
-<#
-.SYNOPSIS
-    設定ウィンドウの表示
-.DESCRIPTION
-    指定グループの設定ウィンドウを表示します。
-    ファイルの追加・削除・移動・BOM変換などの操作が可能です。
-#>
-function Show-ConfigWindow($groupIndex, $groupLabels, $sizeLabels) {
-    $configForm = New-Object System.Windows.Forms.Form
-    $configForm.Text = "$($script:config.groups[$groupIndex].name) - 設定"
-    $configForm.Size = New-Object System.Drawing.Size(650, 550)
-    $configForm.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
-    $configForm.MaximizeBox = $false
-    $configForm.MinimizeBox = $false
-
-    # メインウィンドウの右側に配置
-    $configForm.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
-    $configForm.Location = New-Object System.Drawing.Point(($form.Location.X + $form.Width + 10), $form.Location.Y)
-
-    # グループ名ラベル
-    $lblGroupName = New-Object System.Windows.Forms.Label
-    $lblGroupName.Text = "グループ名:"
-    $lblGroupName.Location = New-Object System.Drawing.Point(10, 15)
-    $lblGroupName.Size = New-Object System.Drawing.Size(100, 20)
-    $configForm.Controls.Add($lblGroupName)
-
-    # グループ名入力
-    $txtGroupName = New-Object System.Windows.Forms.TextBox
-    $txtGroupName.Text = $script:config.groups[$groupIndex].name
-    $txtGroupName.Location = New-Object System.Drawing.Point(120, 13)
-    $txtGroupName.Size = New-Object System.Drawing.Size(500, 20)
-    $configForm.Controls.Add($txtGroupName)
-
-    # ファイルリストボックス
+    # ファイル一覧
     $listBox = New-Object System.Windows.Forms.ListBox
-    $listBox.Location = New-Object System.Drawing.Point(10, 45)
-    $listBox.Size = New-Object System.Drawing.Size(610, 300)
+    $listBox.Location = New-Object System.Drawing.Point(10, 10)
+    $listBox.Size = New-Object System.Drawing.Size(665, 370)
     $listBox.HorizontalScrollbar = $true
+    $listBox.SelectionMode = [System.Windows.Forms.SelectionMode]::MultiExtended
 
-    # ファイルリストを表示用フォーマットで追加
-    foreach ($filePath in $script:config.groups[$groupIndex].files) {
-        $displayText = ConvertTo-DisplayFormat $filePath
-        [void]$listBox.Items.Add($displayText)
+    foreach ($f in $script:currentFiles) {
+        [void]$listBox.Items.Add($f)
     }
-    $configForm.Controls.Add($listBox)
-
-    # 登録数ラベル
-    $lblCount = New-Object System.Windows.Forms.Label
-    $lblCount.Text = "$($listBox.Items.Count)/20"
-    $lblCount.Location = New-Object System.Drawing.Point(10, 355)
-    $lblCount.Size = New-Object System.Drawing.Size(100, 20)
-    $configForm.Controls.Add($lblCount)
-
-    # リストボックス更新用関数
-    $updateListBox = {
-        $listBox.Items.Clear()
-        foreach ($filePath in $script:config.groups[$groupIndex].files) {
-            $displayText = ConvertTo-DisplayFormat $filePath
-            [void]$listBox.Items.Add($displayText)
-        }
-        $lblCount.Text = "$($listBox.Items.Count)/20"
-    }
-
-    # ファイル追加ボタン
-    $btnAdd = New-Object System.Windows.Forms.Button
-    $btnAdd.Text = "ファイル追加"
-    $btnAdd.Location = New-Object System.Drawing.Point(10, 385)
-    $btnAdd.Size = New-Object System.Drawing.Size(100, 30)
-    $btnAdd.Add_Click({
-        if ($script:config.groups[$groupIndex].files.Count -ge 20) {
-            Show-Message "最大20ファイルまでです"
-            return
-        }
-
-        $openFileDialog = New-Object System.Windows.Forms.OpenFileDialog
-        $openFileDialog.Title = "ファイルを選択"
-        $openFileDialog.Filter = "すべてのファイル (*.*)|*.*"
-
-        if ($openFileDialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-            $selectedFile = $openFileDialog.FileName
-
-            if ($script:config.groups[$groupIndex].files -contains $selectedFile) {
-                Show-Message "既に登録されています"
-                return
-            }
-
-            $script:config.groups[$groupIndex].files += $selectedFile
-            & $updateListBox
-            Show-Message "ファイルを追加しました"
-        }
-    })
-    $configForm.Controls.Add($btnAdd)
-
-    # 選択ファイルを削除ボタン
-    $btnRemove = New-Object System.Windows.Forms.Button
-    $btnRemove.Text = "選択ファイルを削除"
-    $btnRemove.Location = New-Object System.Drawing.Point(120, 385)
-    $btnRemove.Size = New-Object System.Drawing.Size(120, 30)
-    $btnRemove.Add_Click({
-        if ($listBox.SelectedIndex -lt 0) {
-            Show-Message "ファイルを選択してください"
-            return
-        }
-
-        $selectedDisplayText = $listBox.SelectedItem
-        $selectedFilePath = ConvertFrom-DisplayFormat $selectedDisplayText
-
-        $script:config.groups[$groupIndex].files = @(
-            $script:config.groups[$groupIndex].files | Where-Object { $_ -ne $selectedFilePath }
-        )
-
-        & $updateListBox
-        Show-Message "ファイルを削除しました"
-    })
-    $configForm.Controls.Add($btnRemove)
-
-    # 全て削除ボタン
-    $btnRemoveAll = New-Object System.Windows.Forms.Button
-    $btnRemoveAll.Text = "全て削除"
-    $btnRemoveAll.Location = New-Object System.Drawing.Point(250, 385)
-    $btnRemoveAll.Size = New-Object System.Drawing.Size(100, 30)
-    $btnRemoveAll.Add_Click({
-        if ($script:config.groups[$groupIndex].files.Count -eq 0) {
-            Show-Message "削除するファイルがありません"
-            return
-        }
-
-        $result = [System.Windows.Forms.MessageBox]::Show(
-            "グループ内の全てのファイル（$($script:config.groups[$groupIndex].files.Count)件）を削除しますか？",
-            "確認",
-            [System.Windows.Forms.MessageBoxButtons]::YesNo,
-            [System.Windows.Forms.MessageBoxIcon]::Question
-        )
-
-        if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
-            $script:config.groups[$groupIndex].files = @()
-            & $updateListBox
-            Show-Message "全てのファイルを削除しました"
-        }
-    })
-    $configForm.Controls.Add($btnRemoveAll)
+    $detailForm.Controls.Add($listBox)
 
     # BOM変換ボタン
     $btnBom = New-Object System.Windows.Forms.Button
     $btnBom.Text = "BOM変換"
-    $btnBom.Location = New-Object System.Drawing.Point(360, 385)
+    $btnBom.Location = New-Object System.Drawing.Point(10, 395)
     $btnBom.Size = New-Object System.Drawing.Size(100, 30)
     $btnBom.Add_Click({
-        if ($listBox.SelectedIndex -lt 0) {
+        if ($listBox.SelectedItems.Count -eq 0) {
             Show-Message "ファイルを選択してください"
             return
         }
-
-        $selectedDisplayText = $listBox.SelectedItem
-        $selectedFilePath = ConvertFrom-DisplayFormat $selectedDisplayText
-
-        if (-not (Test-Path $selectedFilePath)) {
-            Show-Message "ファイルが見つかりません"
-            return
-        }
-
-        # テキストファイルかチェック
-        $textExtensions = @('.txt', '.ps1', '.psm1', '.psd1', '.cs', '.vb', '.js', '.ts',
-                            '.html', '.htm', '.xml', '.json', '.css', '.md', '.log',
-                            '.csv', '.ini', '.config', '.bat', '.cmd', '.py', '.rb',
-                            '.java', '.c', '.cpp', '.h', '.hpp', '.php', '.sh')
-
-        $ext = [System.IO.Path]::GetExtension($selectedFilePath).ToLower()
-
-        if ($textExtensions -notcontains $ext) {
-            Show-Message "テキストファイルではありません"
-            return
-        }
-
-        $fileName = [System.IO.Path]::GetFileName($selectedFilePath)
-        $result = [System.Windows.Forms.MessageBox]::Show(
-            "$fileName をBOM付きUTF-8に変換しますか？`n`n※バックアップは作成されません",
-            "確認",
-            [System.Windows.Forms.MessageBoxButtons]::YesNo,
-            [System.Windows.Forms.MessageBoxIcon]::Question
-        )
-
-        if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
-            try {
-                $content = Get-Content $selectedFilePath -Raw
-                $utf8WithBom = New-Object System.Text.UTF8Encoding($true)
-                [System.IO.File]::WriteAllText($selectedFilePath, $content, $utf8WithBom)
-                Show-Message "$fileName : BOM変換終了"
-            }
-            catch {
-                Show-Message "変換に失敗しました: $_"
-            }
+        foreach ($f in $listBox.SelectedItems) {
+            Convert-ToBomUtf8 $f
         }
     })
-    $configForm.Controls.Add($btnBom)
+    $detailForm.Controls.Add($btnBom)
 
-    # 別グループへ移動ボタン
-    $btnMove = New-Object System.Windows.Forms.Button
-    $btnMove.Text = "別グループへ移動"
-    $btnMove.Location = New-Object System.Drawing.Point(470, 385)
-    $btnMove.Size = New-Object System.Drawing.Size(130, 30)
-    $btnMove.Add_Click({
-        if ($listBox.SelectedIndex -lt 0) {
-            Show-Message "ファイルを選択してください"
-            return
-        }
-
-        # 移動先選択ダイアログ
-        $moveForm = New-Object System.Windows.Forms.Form
-        $moveForm.Text = "移動先グループを選択"
-        $moveForm.Size = New-Object System.Drawing.Size(300, 200)
-        $moveForm.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
-        $moveForm.MaximizeBox = $false
-        $moveForm.MinimizeBox = $false
-        $moveForm.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
-
-        $lblMove = New-Object System.Windows.Forms.Label
-        $lblMove.Text = "移動先グループ:"
-        $lblMove.Location = New-Object System.Drawing.Point(10, 20)
-        $lblMove.Size = New-Object System.Drawing.Size(100, 20)
-        $moveForm.Controls.Add($lblMove)
-
-        $comboBox = New-Object System.Windows.Forms.ComboBox
-        $comboBox.Location = New-Object System.Drawing.Point(10, 50)
-        $comboBox.Size = New-Object System.Drawing.Size(260, 20)
-        $comboBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
-
-        for ($i = 0; $i -lt 4; $i++) {
-            if ($i -ne $groupIndex) {
-                [void]$comboBox.Items.Add("グループ$($i+1): $($script:config.groups[$i].name)")
-            }
-        }
-        $comboBox.SelectedIndex = 0
-        $moveForm.Controls.Add($comboBox)
-
-        $btnMoveOk = New-Object System.Windows.Forms.Button
-        $btnMoveOk.Text = "移動"
-        $btnMoveOk.Location = New-Object System.Drawing.Point(60, 100)
-        $btnMoveOk.Size = New-Object System.Drawing.Size(80, 30)
-        $btnMoveOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
-        $moveForm.Controls.Add($btnMoveOk)
-
-        $btnMoveCancel = New-Object System.Windows.Forms.Button
-        $btnMoveCancel.Text = "キャンセル"
-        $btnMoveCancel.Location = New-Object System.Drawing.Point(150, 100)
-        $btnMoveCancel.Size = New-Object System.Drawing.Size(80, 30)
-        $btnMoveCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-        $moveForm.Controls.Add($btnMoveCancel)
-
-        $moveForm.AcceptButton = $btnMoveOk
-        $moveForm.CancelButton = $btnMoveCancel
-
-        if ($moveForm.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-            # 選択されたグループインデックスを計算
-            $targetGroupIndex = $comboBox.SelectedIndex
-            if ($targetGroupIndex -ge $groupIndex) {
-                $targetGroupIndex++
-            }
-
-            if (Move-FileToGroup $groupIndex $listBox.SelectedIndex $targetGroupIndex) {
-                & $updateListBox
-            }
-        }
+    # 選択項目をクリップボードへ
+    $btnClipSelected = New-Object System.Windows.Forms.Button
+    $btnClipSelected.Text = "クリップボードへ"
+    $btnClipSelected.Location = New-Object System.Drawing.Point(120, 395)
+    $btnClipSelected.Size = New-Object System.Drawing.Size(140, 30)
+    $btnClipSelected.Add_Click({
+        Set-ClipboardFiles @($listBox.SelectedItems)
     })
-    $configForm.Controls.Add($btnMove)
+    $detailForm.Controls.Add($btnClipSelected)
 
-    # フェンス追加ボタン
+    # 選択項目をフェンス付きでクリップボードへ
+    $btnFenceSelected = New-Object System.Windows.Forms.Button
+    $btnFenceSelected.Text = "フェンス付き"
+    $btnFenceSelected.Location = New-Object System.Drawing.Point(270, 395)
+    $btnFenceSelected.Size = New-Object System.Drawing.Size(140, 30)
+    $btnFenceSelected.Add_Click({
+        Set-ClipboardWithFence @($listBox.SelectedItems)
+    })
+    $detailForm.Controls.Add($btnFenceSelected)
+
+    # 閉じるボタン
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Text = "閉じる"
+    $btnClose.Location = New-Object System.Drawing.Point(575, 395)
+    $btnClose.Size = New-Object System.Drawing.Size(100, 30)
+    $btnClose.Add_Click({ $detailForm.Close() })
+    $detailForm.Controls.Add($btnClose)
+
+    # メッセージエリア
+    $msgLabel = New-Object System.Windows.Forms.Label
+    $msgLabel.Location = New-Object System.Drawing.Point(420, 400)
+    $msgLabel.Size = New-Object System.Drawing.Size(245, 20)
+    $msgLabel.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $detailForm.Controls.Add($msgLabel)
+    $script:messageLabel = $msgLabel
+
+    $detailForm.Add_FormClosed({
+        $script:messageLabel = $null
+    })
+
+    [void]$detailForm.ShowDialog()
+}
+
+# ================================================================================
+# メインウィンドウ
+# ================================================================================
+
+function Show-MainWindow {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "File Clipboard Manager"
+    $form.Size = New-Object System.Drawing.Size(500, 280)
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $form.MaximizeBox = $false
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+
+    # フォルダ選択ボタン
+    $btnFolder = New-Object System.Windows.Forms.Button
+    $btnFolder.Text = "フォルダ選択"
+    $btnFolder.Location = New-Object System.Drawing.Point(10, 15)
+    $btnFolder.Size = New-Object System.Drawing.Size(100, 30)
+    $form.Controls.Add($btnFolder)
+
+    # フォルダ履歴（ComboBox）
+    $cmbFolder = New-Object System.Windows.Forms.ComboBox
+    $cmbFolder.Location = New-Object System.Drawing.Point(120, 17)
+    $cmbFolder.Size = New-Object System.Drawing.Size(355, 25)
+    $cmbFolder.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+    $cmbFolder.DropDownWidth = 500
+
+    foreach ($folder in $script:folderHistory) {
+        [void]$cmbFolder.Items.Add($folder)
+    }
+    if ($cmbFolder.Items.Count -gt 0) {
+        $cmbFolder.SelectedIndex = 0
+    }
+
+    $form.Controls.Add($cmbFolder)
+
+    # .gitignore 有効チェックボックス
+    $chkGitignore = New-Object System.Windows.Forms.CheckBox
+    $chkGitignore.Text = ".gitignore を有効にする"
+    $chkGitignore.Location = New-Object System.Drawing.Point(10, 55)
+    $chkGitignore.Size = New-Object System.Drawing.Size(200, 25)
+    $chkGitignore.Checked = $script:gitignoreEnabled
+    $form.Controls.Add($chkGitignore)
+
+    # ---- ボタン群 ----
+
+    # クリップボードへ
+    $btnClip = New-Object System.Windows.Forms.Button
+    $btnClip.Text = "クリップボードへ"
+    $btnClip.Location = New-Object System.Drawing.Point(10, 95)
+    $btnClip.Size = New-Object System.Drawing.Size(140, 30)
+    $btnClip.Add_Click({
+        Set-ClipboardFiles $script:currentFiles
+    })
+    $form.Controls.Add($btnClip)
+
+    # フェンス付きクリップボード
+    $btnFence = New-Object System.Windows.Forms.Button
+    $btnFence.Text = "フェンス付きクリップボード"
+    $btnFence.Location = New-Object System.Drawing.Point(160, 95)
+    $btnFence.Size = New-Object System.Drawing.Size(200, 30)
+    $btnFence.Add_Click({
+        Set-ClipboardWithFence $script:currentFiles
+    })
+    $form.Controls.Add($btnFence)
+
+    # クリップボードにフェンス追加
     $btnAddFence = New-Object System.Windows.Forms.Button
-    $btnAddFence.Text = "フェンス追加"
-    $btnAddFence.Location = New-Object System.Drawing.Point(10, 425)
-    $btnAddFence.Size = New-Object System.Drawing.Size(100, 30)
+    $btnAddFence.Text = "クリップボードにフェンス追加"
+    $btnAddFence.Location = New-Object System.Drawing.Point(10, 135)
+    $btnAddFence.Size = New-Object System.Drawing.Size(200, 30)
     $btnAddFence.Add_Click({
-        if ($listBox.SelectedIndex -lt 0) {
-            Show-Message "ファイルを選択してください"
+        Set-ClipboardAddFence
+    })
+    $form.Controls.Add($btnAddFence)
+
+    # ファイル詳細
+    $btnDetail = New-Object System.Windows.Forms.Button
+    $btnDetail.Text = "ファイル詳細"
+    $btnDetail.Location = New-Object System.Drawing.Point(220, 135)
+    $btnDetail.Size = New-Object System.Drawing.Size(140, 30)
+    $btnDetail.Add_Click({
+        Show-FileDetailWindow
+    })
+    $form.Controls.Add($btnDetail)
+
+    # コード更新
+    $btnRefresh = New-Object System.Windows.Forms.Button
+    $btnRefresh.Text = "コード更新"
+    $btnRefresh.Location = New-Object System.Drawing.Point(370, 135)
+    $btnRefresh.Size = New-Object System.Drawing.Size(100, 30)
+    $btnRefresh.Add_Click({
+        if ([string]::IsNullOrEmpty($script:currentFolder)) {
+            Show-Message "フォルダが選択されていません"
             return
         }
 
-        $selectedDisplayText = $listBox.SelectedItem
-        $selectedFilePath = ConvertFrom-DisplayFormat $selectedDisplayText
-
-        Set-ClipboardTextWithFence $selectedFilePath
+        $script:currentFiles = Invoke-Filter
+        Show-Message "更新しました（$($script:currentFiles.Count)件）"
     })
-    $configForm.Controls.Add($btnAddFence)
+    $form.Controls.Add($btnRefresh)
 
-    # OKボタン
-    $btnOk = New-Object System.Windows.Forms.Button
-    $btnOk.Text = "OK"
-    $btnOk.Location = New-Object System.Drawing.Point(400, 465)
-    $btnOk.Size = New-Object System.Drawing.Size(100, 30)
-    $btnOk.Add_Click({
-        $script:config.groups[$groupIndex].name = $txtGroupName.Text
-        Save-Config
+    # メッセージエリア
+    $script:messageLabel = New-Object System.Windows.Forms.Label
+    $script:messageLabel.Text = ""
+    $script:messageLabel.Location = New-Object System.Drawing.Point(10, 185)
+    $script:messageLabel.Size = New-Object System.Drawing.Size(465, 25)
+    $script:messageLabel.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $script:messageLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $form.Controls.Add($script:messageLabel)
 
-        # メインウィンドウのラベルを更新
-        $groupLabels[$groupIndex].Text = $script:config.groups[$groupIndex].name
-        $sizeLabels[$groupIndex].Text = Get-GroupSize $groupIndex
-
-        $configForm.Close()
+    # タスクトレイアイコン
+    $script:notifyIcon = New-Object System.Windows.Forms.NotifyIcon
+    $script:notifyIcon.Icon = [System.Drawing.SystemIcons]::Application
+    $script:notifyIcon.Text = "File Clipboard Manager"
+    $script:notifyIcon.Visible = $true
+    $script:notifyIcon.Add_Click({
+        $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
+        $form.Activate()
     })
-    $configForm.Controls.Add($btnOk)
 
-    # キャンセルボタン
-    $btnCancel = New-Object System.Windows.Forms.Button
-    $btnCancel.Text = "キャンセル"
-    $btnCancel.Location = New-Object System.Drawing.Point(510, 465)
-    $btnCancel.Size = New-Object System.Drawing.Size(100, 30)
-    $btnCancel.Add_Click({
-        $configForm.Close()
+    $form.Add_FormClosed({
+        $script:notifyIcon.Dispose()
     })
-    $configForm.Controls.Add($btnCancel)
 
-    $configForm.AcceptButton = $btnOk
-    $configForm.CancelButton = $btnCancel
+    # ---- イベント ----
 
-    [void]$configForm.ShowDialog()
+    # フォルダ選択
+    $btnFolder.Add_Click({
+        $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dialog.Description = "プロジェクトフォルダを選択してください"
+        if (-not [string]::IsNullOrEmpty($script:currentFolder)) {
+            $dialog.SelectedPath = $script:currentFolder
+        }
+
+        if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+            $script:currentFolder = $dialog.SelectedPath
+
+            # 履歴に追加
+            Add-FolderHistory $script:currentFolder
+
+            # ComboBox を更新
+            $cmbFolder.Items.Clear()
+            foreach ($folder in $script:folderHistory) {
+                [void]$cmbFolder.Items.Add($folder)
+            }
+            $cmbFolder.SelectedIndex = 0
+
+            $script:currentFiles = Invoke-Filter
+            Save-Settings
+            Show-Message "フォルダを読み込みました（$($script:currentFiles.Count)件）"
+        }
+    })
+
+    # 履歴からフォルダ切替
+    $cmbFolder.Add_SelectedIndexChanged({
+        $selected = $cmbFolder.SelectedItem
+        if ($null -eq $selected) { return }
+        if ($selected -eq $script:currentFolder) { return }
+
+        $script:currentFolder = $selected
+
+        # 選択したフォルダを履歴の先頭に移動
+        Add-FolderHistory $script:currentFolder
+
+        # ComboBox を更新（先頭に移動を反映）
+        $cmbFolder.Items.Clear()
+        foreach ($folder in $script:folderHistory) {
+            [void]$cmbFolder.Items.Add($folder)
+        }
+        $cmbFolder.SelectedIndex = 0
+
+        $script:currentFiles = Invoke-Filter
+        Save-Settings
+        Show-Message "フォルダを切り替えました（$($script:currentFiles.Count)件）"
+    })
+
+    # .gitignore チェック切替
+    $chkGitignore.Add_CheckedChanged({
+        $script:gitignoreEnabled = $chkGitignore.Checked
+        if (-not [string]::IsNullOrEmpty($script:currentFolder)) {
+            $script:currentFiles = Invoke-Filter
+            Show-Message "フィルタリングを更新しました（$($script:currentFiles.Count)件）"
+        }
+        Save-Settings
+    })
+
+    # 起動時に前回フォルダを復元
+    if (-not [string]::IsNullOrEmpty($script:currentFolder)) {
+        $script:currentFiles = Invoke-Filter
+        if ($script:currentFiles.Count -gt 0) {
+            Show-Message "前回のフォルダを読み込みました（$($script:currentFiles.Count)件）"
+        }
+    }
+
+    [void]$form.ShowDialog()
 }
 
 # ================================================================================
 # メイン処理
 # ================================================================================
 
-# 設定ファイルの読み込み
-Load-Config
+if (-not (Test-Requirements)) { exit }
 
-# メインウィンドウの表示
+Load-Settings
 Show-MainWindow
