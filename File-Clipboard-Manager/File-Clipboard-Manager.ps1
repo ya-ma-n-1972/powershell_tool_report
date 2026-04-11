@@ -217,12 +217,21 @@ function Invoke-Filter {
     }
 
     try {
-        $filterArgs = @($script:filterScriptPath, $script:currentFolder)
+        # 日本語ファイル名対策: Pythonの stdio を UTF-8 に固定
+        $filterArgs = @("-X", "utf8", $script:filterScriptPath, $script:currentFolder)
         if (-not $script:gitignoreEnabled) {
             $filterArgs += "--no-gitignore"
         }
 
-        $output = & python @filterArgs 2>&1
+        # PowerShell側も UTF-8 で受け取る
+        $prevEncoding = [Console]::OutputEncoding
+        [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        try {
+            $output = & python @filterArgs 2>&1
+        }
+        finally {
+            [Console]::OutputEncoding = $prevEncoding
+        }
         if ($LASTEXITCODE -ne 0) {
             $errMsg = $output | Where-Object { $_ -match "^ERROR:" }
             Show-Message "フィルタリングエラー: $errMsg"
