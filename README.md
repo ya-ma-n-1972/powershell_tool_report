@@ -77,3 +77,8 @@ Excel装飾自動化ツール - PowerShell COMオブジェクト デモンスト
 
 ### set_file_timestamps.ps1
 よくあるファイルのタイムスタンプ変更ツールです。PowerShellしか使えない環境でどうぞ。
+<hr></hr>
+
+### スタートメニュー登録ツール
+任意の実行ファイル（.exe / .ps1 / .pyw / .py / .bat など）を、GUIで入力するだけでWindowsのスタートメニューにショートカット（.lnk）として登録するツールです。  
+ファイルのドラッグ＆ドロップ、.ps1の自動ラップ起動（ExecutionPolicy Bypass / ウィンドウ非表示 / PowerShell 7起動）、.py・.pywのpythonw起動（コンソール非表示）に対応しています。
