@@ -3,6 +3,13 @@
 PowerShellScriptの、ちょっと便利なツールやレポート集  
 <hr></hr>
 
+### ClaudeCode-Codex-DataCleaner
+Claude Code / OpenAI Codex CLI のプロジェクト永続化データクリーナー - Windows/WSL2両対応 GUI
+
+`~/.claude/`・`~/.codex/` 配下に溜まる会話トランスクリプト・履歴・タスク・ファイル編集履歴などを、プロジェクト単位で選択して安全に削除するツールです。
+Dry-Run（削除プラン表示）、セッション単位の会話履歴Markdown抽出、稼働中プロセスの保護付き終了に対応。公式 `claude project purge` 相当以上の射程をカバーします。
+<hr></hr>
+
 ### File-Clipboard-Manager
 
 複数のファイルをグループ管理し、クリップボードに一括登録できるPowerShellツールです。
