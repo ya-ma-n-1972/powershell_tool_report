@@ -68,12 +68,7 @@ powershell -ExecutionPolicy Bypass -File ".\ClaudeCode-Codex-DataCleaner.ps1"
 - パース不能な JSONL 行はそのまま保持（破壊回避）
 - WSL 側ファイルの書き戻しは LF 改行を強制（CRLF 混入防止）
 - 稼働中の Claude/Codex セッションは対象ファイルがロックされ、削除に失敗する場合があります（終了してから実行してください）
-- **Codex の `state_5.sqlite` は温存される**ため、rollout 削除後にインデックスと実体の不整合（`codex resume` 等に痕跡が残る）が生じることがあります。詳細は [DOC/特徴と機能一覧](DOC/ClaudeCodeデータクリーナー_特徴と機能一覧.md) を参照
-
-## ドキュメント
-
-- [特徴と機能一覧](DOC/ClaudeCodeデータクリーナー_特徴と機能一覧.md)
-- [コード分析レポート](DOC/ClaudeCodeデータクリーナー_コード分析レポート.md)
+- **Codex の `state_5.sqlite` は温存される**ため、rollout 削除後にインデックスと実体の不整合（`codex resume` 等に痕跡が残る）が生じることがあります。
 
 ## ライセンス
 

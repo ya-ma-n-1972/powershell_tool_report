@@ -1,0 +1,25 @@
+# Claude Code ローカル設定（個人のローカルパス・許可リストを含むため公開しない）
+.claude/settings.local.json
+
+# 内部用の AI 作業指示（製品ドキュメントではないため公開しない）
+CLAUDE.md
+
+# 内部ドキュメント（非公開）
+DOC/
+
+# 本ツールが生成するバックアップ
+*.bak
+
+# 会話履歴エクスポート（任意・個人データを含みうる）
+*.md.export
+export/
+
+# OS 生成物
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# エディタ
+.vscode/
+.idea/
+*.swp
